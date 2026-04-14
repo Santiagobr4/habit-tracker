@@ -338,3 +338,25 @@ class HabitApiTests(APITestCase):
 		response = self.client.get('/api/habits/leaderboard/?days=30')
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
 		self.assertIn('results', response.data)
+		if response.data['results']:
+			self.assertIn('daily_completion', response.data['results'][0])
+			self.assertIn('weekly_completion', response.data['results'][0])
+			self.assertIn('monthly_completion', response.data['results'][0])
+
+	def test_profile_remove_avatar_clears_avatar_url(self):
+		self.authenticate('alice', 'Passw0rd123')
+
+		response_set = self.client.patch(
+			'/api/profile/',
+			{'avatar_url': 'https://example.com/avatar.png'},
+			format='json',
+		)
+		self.assertEqual(response_set.status_code, status.HTTP_200_OK)
+
+		response_remove = self.client.patch(
+			'/api/profile/',
+			{'remove_avatar': True},
+			format='json',
+		)
+		self.assertEqual(response_remove.status_code, status.HTTP_200_OK)
+		self.assertEqual(response_remove.data['avatar_url'], '')

@@ -480,9 +480,31 @@ class HabitViewSet(viewsets.ModelViewSet):
         ranking = []
         for user in User.objects.all().order_by('id'):
             metrics = _compute_range_metrics(user, start_date, end_date)
-            avg = metrics['summary']['average_daily_completion']
-            if avg is None:
+            avg_daily = metrics['summary']['average_daily_completion']
+            if avg_daily is None:
                 continue
+
+            weekly_values = [
+                row['completion']
+                for row in metrics.get('weekly', [])
+                if row.get('completion') is not None
+            ]
+            monthly_values = [
+                row['completion']
+                for row in metrics.get('monthly', [])
+                if row.get('completion') is not None
+            ]
+
+            avg_weekly = (
+                round(sum(weekly_values) / len(weekly_values), 0)
+                if weekly_values
+                else None
+            )
+            avg_monthly = (
+                round(sum(monthly_values) / len(monthly_values), 0)
+                if monthly_values
+                else None
+            )
 
             profile = getattr(user, 'profile', None)
             avatar_url = None
@@ -494,13 +516,15 @@ class HabitViewSet(viewsets.ModelViewSet):
                     'username': user.username,
                     'display_name': (user.first_name or '').strip() or user.username,
                     'avatar_file_url': avatar_url,
-                    'average_completion': avg,
+                    'daily_completion': avg_daily,
+                    'weekly_completion': avg_weekly,
+                    'monthly_completion': avg_monthly,
                     'active_days': metrics['summary']['active_days'],
                 }
             )
 
         ranking.sort(
-            key=lambda row: (row['average_completion'], row['active_days']),
+            key=lambda row: (row['daily_completion'], row['active_days']),
             reverse=True,
         )
 

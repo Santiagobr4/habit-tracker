@@ -195,9 +195,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
         remove_avatar = validated_data.pop('remove_avatar', False)
         user_data = validated_data.pop('user', {})
 
-        if remove_avatar and instance.avatar:
-            instance.avatar.delete(save=False)
+        if remove_avatar:
+            if instance.avatar:
+                instance.avatar.delete(save=False)
             instance.avatar = None
+            instance.avatar_url = ''
 
         for field, value in validated_data.items():
             setattr(instance, field, value)
