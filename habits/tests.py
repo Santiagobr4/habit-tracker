@@ -10,6 +10,11 @@ from .models import Habit, HabitLog
 
 class HabitApiTests(APITestCase):
 	def setUp(self):
+		self.today = timezone.localdate()
+		self.week_start = self.today - timedelta(days=self.today.weekday())
+		self.tomorrow = self.today + timedelta(days=1)
+		self.yesterday = self.today - timedelta(days=1)
+
 		self.user_1 = User.objects.create_user(
 			username='alice',
 			password='Passw0rd123',
@@ -25,13 +30,13 @@ class HabitApiTests(APITestCase):
 			user=self.user_1,
 			name='Read 20 mins',
 			days=['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
-			start_date=date(2026, 4, 13),
+			start_date=self.week_start,
 		)
 		self.habit_user_2 = Habit.objects.create(
 			user=self.user_2,
 			name='Run 5km',
 			days=['monday', 'wednesday', 'friday'],
-			start_date=date(2026, 4, 13),
+			start_date=self.week_start,
 		)
 
 	def authenticate(self, username, password):
@@ -80,7 +85,7 @@ class HabitApiTests(APITestCase):
 	def test_weekly_returns_only_current_user_habits(self):
 		self.authenticate('alice', 'Passw0rd123')
 
-		response = self.client.get('/api/habits/weekly/?start_date=2026-04-13')
+		response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
 
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
 		self.assertEqual(len(response.data['habits']), 1)
@@ -93,7 +98,7 @@ class HabitApiTests(APITestCase):
 			'/api/logs/',
 			{
 				'habit': self.habit_user_2.id,
-				'date': '2026-04-14',
+				'date': str(self.today),
 				'status': 'done',
 			},
 			format='json',
@@ -103,7 +108,7 @@ class HabitApiTests(APITestCase):
 		self.assertFalse(
 			HabitLog.objects.filter(
 				habit=self.habit_user_2,
-				date='2026-04-14',
+				date=str(self.today),
 			).exists()
 		)
 
@@ -114,7 +119,7 @@ class HabitApiTests(APITestCase):
 			'/api/logs/',
 			{
 				'habit': self.habit_user_1.id,
-				'date': '2026-04-14',
+				'date': str(self.today),
 				'status': 'done',
 			},
 			format='json',
@@ -125,14 +130,14 @@ class HabitApiTests(APITestCase):
 			'/api/logs/',
 			{
 				'habit': self.habit_user_1.id,
-				'date': '2026-04-14',
+				'date': str(self.today),
 				'status': 'missed',
 			},
 			format='json',
 		)
 		self.assertEqual(update_response.status_code, status.HTTP_200_OK)
 
-		log = HabitLog.objects.get(habit=self.habit_user_1, date='2026-04-14')
+		log = HabitLog.objects.get(habit=self.habit_user_1, date=str(self.today))
 		self.assertEqual(log.status, 'missed')
 
 	def test_pending_status_removes_existing_log(self):
@@ -140,7 +145,7 @@ class HabitApiTests(APITestCase):
 
 		HabitLog.objects.create(
 			habit=self.habit_user_1,
-			date='2026-04-14',
+			date=str(self.today),
 			status='done',
 		)
 
@@ -148,7 +153,7 @@ class HabitApiTests(APITestCase):
 			'/api/logs/',
 			{
 				'habit': self.habit_user_1.id,
-				'date': '2026-04-14',
+				'date': str(self.today),
 				'status': 'pending',
 			},
 			format='json',
@@ -158,33 +163,48 @@ class HabitApiTests(APITestCase):
 		self.assertFalse(
 			HabitLog.objects.filter(
 				habit=self.habit_user_1,
-				date='2026-04-14',
+				date=str(self.today),
 			).exists()
 		)
 
-	def test_done_status_is_rejected_for_future_date(self):
+	def test_log_update_is_rejected_for_future_date(self):
 		self.authenticate('alice', 'Passw0rd123')
 
-		future_date = timezone.localdate().replace(year=timezone.localdate().year + 1)
 		response = self.client.post(
 			'/api/logs/',
 			{
 				'habit': self.habit_user_1.id,
-				'date': str(future_date),
+				'date': str(self.tomorrow),
 				'status': 'done',
 			},
 			format='json',
 		)
 
 		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-		self.assertIn('status', response.data)
+		self.assertIn('date', response.data)
+
+	def test_log_update_is_rejected_for_past_date(self):
+		self.authenticate('alice', 'Passw0rd123')
+
+		response = self.client.post(
+			'/api/logs/',
+			{
+				'habit': self.habit_user_1.id,
+				'date': str(self.yesterday),
+				'status': 'missed',
+			},
+			format='json',
+		)
+
+		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+		self.assertIn('date', response.data)
 
 	def test_editing_days_preserves_past_history(self):
 		self.authenticate('alice', 'Passw0rd123')
 
 		HabitLog.objects.create(
 			habit=self.habit_user_1,
-			date='2026-04-14',
+			date=str(self.today),
 			status='done',
 		)
 
@@ -195,11 +215,11 @@ class HabitApiTests(APITestCase):
 		)
 		self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
 
-		weekly_response = self.client.get('/api/habits/weekly/?start_date=2026-04-14')
+		weekly_response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
 		self.assertEqual(weekly_response.status_code, status.HTTP_200_OK)
 
 		habit_row = weekly_response.data['habits'][0]
-		self.assertEqual(habit_row['week']['2026-04-14'], 'done')
+		self.assertEqual(habit_row['week'][str(self.today)], 'done')
 
 	def test_history_endpoint_returns_daily_weekly_monthly(self):
 		self.authenticate('alice', 'Passw0rd123')
@@ -244,7 +264,6 @@ class HabitApiTests(APITestCase):
 			'birth_date': '1995-04-12',
 			'weight_kg': '62.50',
 			'gender': 'female',
-			'avatar_url': 'https://example.com/avatar.png',
 		}
 		response = self.client.patch('/api/profile/', payload, format='json')
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -256,16 +275,11 @@ class HabitApiTests(APITestCase):
 
 		HabitLog.objects.create(
 			habit=self.habit_user_1,
-			date='2026-04-14',
-			status='done',
-		)
-		HabitLog.objects.create(
-			habit=self.habit_user_1,
-			date='2026-04-15',
+			date=str(self.today),
 			status='done',
 		)
 
-		response = self.client.get('/api/habits/weekly/?start_date=2026-04-14')
+		response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
 		self.assertIn('streak_current', response.data['habits'][0])
 		self.assertIn('streak_best', response.data['habits'][0])
@@ -284,13 +298,43 @@ class HabitApiTests(APITestCase):
 
 		HabitLog.objects.create(
 			habit=self.habit_user_1,
-			date='2026-04-13',
+			date=str(self.today),
 			status='done',
 		)
 
-		response = self.client.get('/api/habits/weekly/?start_date=2026-04-13')
+		response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
 
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
 		self.assertIn('average_completion', response.data)
 		self.assertIn('daily_percentages', response.data)
-		self.assertIn('2026-04-13', response.data['daily_percentages'])
+		self.assertIn(str(self.today), response.data['daily_percentages'])
+
+	def test_soft_delete_preserves_previous_day_metrics(self):
+		self.authenticate('alice', 'Passw0rd123')
+
+		HabitLog.objects.create(habit=self.habit_user_1, date=str(self.today), status='done')
+		second_habit = Habit.objects.create(
+			user=self.user_1,
+			name='Study 30 mins',
+			days=['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'],
+			start_date=self.week_start,
+		)
+
+		response_before = self.client.get(f'/api/habits/history/?start_date={self.today}&end_date={self.today}')
+		self.assertEqual(response_before.status_code, status.HTTP_200_OK)
+		self.assertEqual(response_before.data['daily'][0]['completion'], 50)
+
+		delete_response = self.client.delete(f'/api/habits/{second_habit.id}/')
+		self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+		response_after = self.client.get(f'/api/habits/history/?start_date={self.today}&end_date={self.today}')
+		self.assertEqual(response_after.status_code, status.HTTP_200_OK)
+		self.assertEqual(response_after.data['daily'][0]['completion'], 50)
+
+	def test_leaderboard_endpoint_returns_users(self):
+		self.authenticate('alice', 'Passw0rd123')
+		HabitLog.objects.create(habit=self.habit_user_1, date=str(self.today), status='done')
+
+		response = self.client.get('/api/habits/leaderboard/?days=30')
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		self.assertIn('results', response.data)

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+from django.contrib.auth.models import User
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -47,6 +48,14 @@ def _metrics_baseline_date(user, habit_list):
 
     first_habit_start = min(h.start_date for h in habit_list)
     return max(user_start, first_habit_start)
+
+
+def _habit_is_active_on_date(habit, target_date):
+    if target_date < habit.start_date:
+        return False
+    if habit.archived_at and target_date >= habit.archived_at:
+        return False
+    return True
 
 
 def _compute_range_metrics(user, start_date, end_date):
@@ -111,7 +120,7 @@ def _compute_range_metrics(user, start_date, end_date):
         weekday = current_date.strftime("%A").lower()
 
         for habit in habit_list:
-            if current_date < habit.start_date:
+            if not _habit_is_active_on_date(habit, current_date):
                 continue
 
             active_days = _days_for_habit_on_date(habit, current_date, schedule_map)
@@ -232,10 +241,15 @@ class HabitViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Habit.objects.filter(user=self.request.user)
+        return Habit.objects.filter(user=self.request.user, is_archived=False)
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+    def perform_destroy(self, instance):
+        instance.is_archived = True
+        instance.archived_at = timezone.localdate() + timedelta(days=1)
+        instance.save(update_fields=['is_archived', 'archived_at'])
 
     @action(detail=False, methods=['get'], url_path='by-date')
     def by_date(self, request):
@@ -451,6 +465,54 @@ class HabitViewSet(viewsets.ModelViewSet):
 
         payload = _compute_range_metrics(request.user, start_date, end_date)
         return Response(payload)
+
+    @action(detail=False, methods=['get'], url_path='leaderboard')
+    def leaderboard(self, request):
+        days_str = request.query_params.get('days', '30')
+        try:
+            days = max(7, min(365, int(days_str)))
+        except ValueError:
+            return Response({"error": "days must be a valid integer"}, status=400)
+
+        end_date = timezone.localdate()
+        start_date = end_date - timedelta(days=days - 1)
+
+        ranking = []
+        for user in User.objects.all().order_by('id'):
+            metrics = _compute_range_metrics(user, start_date, end_date)
+            avg = metrics['summary']['average_daily_completion']
+            if avg is None:
+                continue
+
+            profile = getattr(user, 'profile', None)
+            avatar_url = None
+            if profile and profile.avatar:
+                avatar_url = request.build_absolute_uri(profile.avatar.url)
+
+            ranking.append(
+                {
+                    'username': user.username,
+                    'display_name': (user.first_name or '').strip() or user.username,
+                    'avatar_file_url': avatar_url,
+                    'average_completion': avg,
+                    'active_days': metrics['summary']['active_days'],
+                }
+            )
+
+        ranking.sort(
+            key=lambda row: (row['average_completion'], row['active_days']),
+            reverse=True,
+        )
+
+        return Response(
+            {
+                'range': {
+                    'start_date': str(start_date),
+                    'end_date': str(end_date),
+                },
+                'results': ranking[:20],
+            }
+        )
 
 
 class HabitLogViewSet(viewsets.ModelViewSet):
