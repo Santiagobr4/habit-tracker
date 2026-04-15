@@ -287,11 +287,28 @@ class HabitApiTests(APITestCase):
 	def test_tracker_metrics_endpoint(self):
 		self.authenticate('alice', 'Passw0rd123')
 
-		response = self.client.get('/api/habits/tracker-metrics/')
+		response = self.client.get(f'/api/habits/tracker-metrics/?start_date={self.week_start}')
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
-		self.assertIn('today', response.data)
+		self.assertIn('focus', response.data)
+		self.assertIn('focus_date', response.data)
+		self.assertIn('is_current_week', response.data)
 		self.assertIn('week', response.data)
 		self.assertIn('daily', response.data)
+
+	def test_tracker_metrics_rejects_future_week(self):
+		self.authenticate('alice', 'Passw0rd123')
+
+		future_week = self.week_start + timedelta(days=7)
+		response = self.client.get(f'/api/habits/tracker-metrics/?start_date={future_week}')
+		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+	def test_tracker_metrics_normalizes_non_monday_start_date(self):
+		self.authenticate('alice', 'Passw0rd123')
+
+		non_monday = self.week_start + timedelta(days=1)
+		response = self.client.get(f'/api/habits/tracker-metrics/?start_date={non_monday}')
+		self.assertEqual(response.status_code, status.HTTP_200_OK)
+		self.assertEqual(response.data['week']['start_date'], str(self.week_start))
 
 	def test_weekly_metrics_contains_average_and_daily_percentages(self):
 		self.authenticate('alice', 'Passw0rd123')

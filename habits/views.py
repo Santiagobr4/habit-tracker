@@ -41,7 +41,10 @@ def _days_for_habit_on_date(habit, target_date, schedule_map):
 
 
 def _metrics_baseline_date(user, habit_list):
-    user_start = timezone.localdate() if not user.date_joined else user.date_joined.date()
+    if not user.date_joined:
+        user_start = timezone.localdate()
+    else:
+        user_start = timezone.localtime(user.date_joined).date()
 
     if not habit_list:
         return user_start
@@ -409,23 +412,44 @@ class HabitViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='tracker-metrics')
     def tracker_metrics(self, request):
         today = timezone.localdate()
-        week_start = today - timedelta(days=today.weekday())
+        current_week_start = today - timedelta(days=today.weekday())
 
-        payload = _compute_range_metrics(request.user, week_start, today)
+        start_date_str = request.query_params.get('start_date')
+        if start_date_str:
+            try:
+                week_start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                return Response({"error": "Invalid start_date format"}, status=400)
+            week_start = week_start - timedelta(days=week_start.weekday())
+        else:
+            week_start = current_week_start
 
-        today_row = next(
-            (row for row in payload["daily"] if row["date"] == str(today)),
-            {"date": str(today), "completion": None, "done": 0, "total": 0},
+        if week_start > current_week_start:
+            return Response({"error": "Future weeks are not allowed"}, status=400)
+
+        week_end = week_start + timedelta(days=6)
+        focus_date = min(week_end, today)
+        payload = _compute_range_metrics(request.user, week_start, focus_date)
+
+        focus_row = next(
+            (row for row in payload["daily"] if row["date"] == str(focus_date)),
+            {"date": str(focus_date), "completion": None, "done": 0, "total": 0},
         )
         week_rows = payload.get("weekly") or []
-        week_completion = week_rows[-1]["completion"] if week_rows else None
+        selected_week = next(
+            (row for row in week_rows if row.get("start_date") == str(week_start)),
+            None,
+        )
+        week_completion = selected_week["completion"] if selected_week else None
 
         return Response(
             {
-                "today": today_row,
+                "focus": focus_row,
+                "focus_date": str(focus_date),
+                "is_current_week": week_start == current_week_start,
                 "week": {
                     "start_date": str(week_start),
-                    "end_date": str(today),
+                    "end_date": str(focus_date),
                     "completion": week_completion,
                 },
                 "daily": payload["daily"],
@@ -468,43 +492,41 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='leaderboard')
     def leaderboard(self, request):
-        days_str = request.query_params.get('days', '30')
-        try:
-            days = max(7, min(365, int(days_str)))
-        except ValueError:
-            return Response({"error": "days must be a valid integer"}, status=400)
-
-        end_date = timezone.localdate()
-        start_date = end_date - timedelta(days=days - 1)
+        today = timezone.localdate()
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
 
         ranking = []
         for user in User.objects.all().order_by('id'):
-            metrics = _compute_range_metrics(user, start_date, end_date)
-            avg_daily = metrics['summary']['average_daily_completion']
-            if avg_daily is None:
+            if user.is_superuser:
                 continue
 
-            weekly_values = [
-                row['completion']
-                for row in metrics.get('weekly', [])
-                if row.get('completion') is not None
-            ]
-            monthly_values = [
-                row['completion']
-                for row in metrics.get('monthly', [])
-                if row.get('completion') is not None
-            ]
+            daily_metrics = _compute_range_metrics(user, today, today)
+            weekly_metrics = _compute_range_metrics(user, week_start, today)
+            monthly_metrics = _compute_range_metrics(user, month_start, today)
 
-            avg_weekly = (
-                round(sum(weekly_values) / len(weekly_values), 0)
-                if weekly_values
+            daily_rows = daily_metrics.get('daily', [])
+            daily_row = daily_rows[0] if daily_rows else None
+            daily_completion = daily_row.get('completion') if daily_row else None
+
+            weekly_done = sum(row.get('done', 0) for row in weekly_metrics.get('daily', []))
+            weekly_total = sum(row.get('total', 0) for row in weekly_metrics.get('daily', []))
+            weekly_completion = (
+                round((weekly_done / weekly_total) * 100, 0)
+                if weekly_total > 0
                 else None
             )
-            avg_monthly = (
-                round(sum(monthly_values) / len(monthly_values), 0)
-                if monthly_values
+
+            monthly_done = sum(row.get('done', 0) for row in monthly_metrics.get('daily', []))
+            monthly_total = sum(row.get('total', 0) for row in monthly_metrics.get('daily', []))
+            monthly_completion = (
+                round((monthly_done / monthly_total) * 100, 0)
+                if monthly_total > 0
                 else None
             )
+
+            if daily_completion is None and weekly_completion is None and monthly_completion is None:
+                continue
 
             profile = getattr(user, 'profile', None)
             avatar_url = None
@@ -516,23 +538,38 @@ class HabitViewSet(viewsets.ModelViewSet):
                     'username': user.username,
                     'display_name': (user.first_name or '').strip() or user.username,
                     'avatar_file_url': avatar_url,
-                    'daily_completion': avg_daily,
-                    'weekly_completion': avg_weekly,
-                    'monthly_completion': avg_monthly,
-                    'active_days': metrics['summary']['active_days'],
+                    'daily_completion': daily_completion,
+                    'weekly_completion': weekly_completion,
+                    'monthly_completion': monthly_completion,
+                    'active_days': monthly_metrics['summary']['active_days'],
                 }
             )
 
         ranking.sort(
-            key=lambda row: (row['daily_completion'], row['active_days']),
+            key=lambda row: (
+                row['daily_completion'] if row['daily_completion'] is not None else -1,
+                row['weekly_completion'] if row['weekly_completion'] is not None else -1,
+                row['monthly_completion'] if row['monthly_completion'] is not None else -1,
+                row['active_days'],
+            ),
             reverse=True,
         )
 
         return Response(
             {
                 'range': {
-                    'start_date': str(start_date),
-                    'end_date': str(end_date),
+                    'day': {
+                        'start_date': str(today),
+                        'end_date': str(today),
+                    },
+                    'week': {
+                        'start_date': str(week_start),
+                        'end_date': str(today),
+                    },
+                    'month': {
+                        'start_date': str(month_start),
+                        'end_date': str(today),
+                    },
                 },
                 'results': ranking[:20],
             }
