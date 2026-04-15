@@ -46,11 +46,15 @@ def _metrics_baseline_date(user, habit_list):
     else:
         user_start = timezone.localtime(user.date_joined).date()
 
-    if not habit_list:
-        return user_start
+    return user_start
 
-    first_habit_start = min(h.start_date for h in habit_list)
-    return max(user_start, first_habit_start)
+
+def _registration_week_start(user):
+    if not user.date_joined:
+        return timezone.localdate() - timedelta(days=timezone.localdate().weekday())
+
+    joined_date = timezone.localtime(user.date_joined).date()
+    return joined_date - timedelta(days=joined_date.weekday())
 
 
 def _habit_is_active_on_date(habit, target_date):
@@ -201,6 +205,16 @@ def _compute_range_metrics(user, start_date, end_date):
     }
 
 
+def _overall_completion(rows):
+    total_done = sum(row.get("done", 0) for row in rows if row.get("total", 0) > 0)
+    total_applicable = sum(row.get("total", 0) for row in rows if row.get("total", 0) > 0)
+
+    if total_applicable <= 0:
+        return None
+
+    return round((total_done / total_applicable) * 100, 0)
+
+
 def _compute_habit_streaks(habit, schedule_map, logs_map, end_date):
     applicable_dates = []
     cursor = habit.start_date
@@ -249,10 +263,36 @@ class HabitViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    def _require_sunday(self):
+        if timezone.localdate().weekday() != 6:
+            return Response(
+                {"detail": "You can only edit or delete habits on Sunday."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    def update(self, request, *args, **kwargs):
+        sunday_check = self._require_sunday()
+        if sunday_check:
+            return sunday_check
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        sunday_check = self._require_sunday()
+        if sunday_check:
+            return sunday_check
+        return super().partial_update(request, *args, **kwargs)
+
     def perform_destroy(self, instance):
         instance.is_archived = True
         instance.archived_at = timezone.localdate() + timedelta(days=1)
         instance.save(update_fields=['is_archived', 'archived_at'])
+
+    def destroy(self, request, *args, **kwargs):
+        sunday_check = self._require_sunday()
+        if sunday_check:
+            return sunday_check
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=False, methods=['get'], url_path='by-date')
     def by_date(self, request):
@@ -308,6 +348,17 @@ class HabitViewSet(viewsets.ModelViewSet):
             return Response({"error": "Invalid date format"}, status=400)
 
         week_dates = [start_date + timedelta(days=i) for i in range(7)]
+        registration_week_start = _registration_week_start(request.user)
+
+        if start_date < registration_week_start:
+            return Response(
+                {
+                    "error": "Weeks before your registration date are not available.",
+                    "earliest_week_start": str(registration_week_start),
+                },
+                status=400,
+            )
+
         habits = list(self.get_queryset())
         result = []
         schedule_map = _build_schedule_map(habits)
@@ -413,6 +464,7 @@ class HabitViewSet(viewsets.ModelViewSet):
     def tracker_metrics(self, request):
         today = timezone.localdate()
         current_week_start = today - timedelta(days=today.weekday())
+        registration_week_start = _registration_week_start(request.user)
 
         start_date_str = request.query_params.get('start_date')
         if start_date_str:
@@ -423,6 +475,15 @@ class HabitViewSet(viewsets.ModelViewSet):
             week_start = week_start - timedelta(days=week_start.weekday())
         else:
             week_start = current_week_start
+
+        if week_start < registration_week_start:
+            return Response(
+                {
+                    "error": "Weeks before your registration date are not available.",
+                    "earliest_week_start": str(registration_week_start),
+                },
+                status=400,
+            )
 
         if week_start > current_week_start:
             return Response({"error": "Future weeks are not allowed"}, status=400)
@@ -504,10 +565,19 @@ class HabitViewSet(viewsets.ModelViewSet):
             daily_metrics = _compute_range_metrics(user, today, today)
             weekly_metrics = _compute_range_metrics(user, week_start, today)
             monthly_metrics = _compute_range_metrics(user, month_start, today)
+            overall_metrics = _compute_range_metrics(user, _metrics_baseline_date(user, list(Habit.objects.filter(user=user))), today)
 
             daily_rows = daily_metrics.get('daily', [])
             daily_row = daily_rows[0] if daily_rows else None
             daily_completion = daily_row.get('completion') if daily_row else None
+
+            daily_total = sum(row.get('total', 0) for row in daily_rows if row.get('total', 0) > 0)
+            daily_done = sum(row.get('done', 0) for row in daily_rows if row.get('total', 0) > 0)
+            daily_completion = (
+                round((daily_done / daily_total) * 100, 0)
+                if daily_total > 0
+                else None
+            )
 
             weekly_done = sum(row.get('done', 0) for row in weekly_metrics.get('daily', []))
             weekly_total = sum(row.get('total', 0) for row in weekly_metrics.get('daily', []))
@@ -525,6 +595,8 @@ class HabitViewSet(viewsets.ModelViewSet):
                 else None
             )
 
+            historical_completion = _overall_completion(overall_metrics.get('daily', []))
+
             if daily_completion is None and weekly_completion is None and monthly_completion is None:
                 continue
 
@@ -541,7 +613,7 @@ class HabitViewSet(viewsets.ModelViewSet):
                     'daily_completion': daily_completion,
                     'weekly_completion': weekly_completion,
                     'monthly_completion': monthly_completion,
-                    'active_days': monthly_metrics['summary']['active_days'],
+                    'historical_completion': historical_completion,
                 }
             )
 
@@ -550,10 +622,19 @@ class HabitViewSet(viewsets.ModelViewSet):
                 row['daily_completion'] if row['daily_completion'] is not None else -1,
                 row['weekly_completion'] if row['weekly_completion'] is not None else -1,
                 row['monthly_completion'] if row['monthly_completion'] is not None else -1,
-                row['active_days'],
+                row['historical_completion'] if row['historical_completion'] is not None else -1,
+                row['display_name'].lower(),
             ),
             reverse=True,
         )
+
+        daily_top = next((row['daily_completion'] for row in ranking if row['daily_completion'] is not None), None)
+        weekly_top = next((row['weekly_completion'] for row in ranking if row['weekly_completion'] is not None), None)
+        historical_top = next((row['historical_completion'] for row in ranking if row['historical_completion'] is not None), None)
+
+        daily_leaders = [row for row in ranking if row['daily_completion'] == daily_top] if daily_top is not None else []
+        weekly_leaders = [row for row in ranking if row['weekly_completion'] == weekly_top] if weekly_top is not None else []
+        historical_leaders = [row for row in ranking if row['historical_completion'] == historical_top] if historical_top is not None else []
 
         return Response(
             {
@@ -569,6 +650,23 @@ class HabitViewSet(viewsets.ModelViewSet):
                     'month': {
                         'start_date': str(month_start),
                         'end_date': str(today),
+                    },
+                },
+                'highlights': {
+                    'daily': {
+                        'score': daily_top,
+                        'leaders': daily_leaders,
+                        'total': len(ranking),
+                    },
+                    'weekly': {
+                        'score': weekly_top,
+                        'leaders': weekly_leaders,
+                        'total': len(ranking),
+                    },
+                    'historical': {
+                        'score': historical_top,
+                        'leaders': historical_leaders,
+                        'total': len(ranking),
                     },
                 },
                 'results': ranking[:20],
