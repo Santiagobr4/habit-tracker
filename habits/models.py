@@ -1,9 +1,17 @@
+"""Database models for habits, schedules, logs, and user profile data."""
+
 from django.db import models
 from datetime import date
 from django.contrib.auth.models import User
 
 
 class Habit(models.Model):
+    """A user-defined habit with current schedule settings.
+
+    The `days` field stores the active weekdays for the current schedule.
+    Historical schedule changes are tracked in `HabitSchedule`.
+    """
+
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     name = models.CharField(max_length=255)
     days = models.JSONField()  # Example: ["monday", "wednesday"]
@@ -11,11 +19,13 @@ class Habit(models.Model):
     is_archived = models.BooleanField(default=False)
     archived_at = models.DateField(null=True, blank=True)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
 class HabitSchedule(models.Model):
+    """Snapshot of a habit schedule effective from a specific date."""
+
     habit = models.ForeignKey(
         Habit,
         on_delete=models.CASCADE,
@@ -28,11 +38,13 @@ class HabitSchedule(models.Model):
         unique_together = ['habit', 'effective_from']
         ordering = ['effective_from']
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.habit.name} from {self.effective_from}"
 
 
 class HabitLog(models.Model):
+    """Per-day completion status for a habit."""
+
     STATUS_CHOICES = [
         ('done', 'Done'),
         ('missed', 'Missed'),
@@ -43,7 +55,7 @@ class HabitLog(models.Model):
     date = models.DateField()
     status = models.CharField(max_length=10, choices=STATUS_CHOICES)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.habit.name} - {self.date}"
 
     class Meta:
@@ -51,6 +63,8 @@ class HabitLog(models.Model):
 
 
 class UserProfile(models.Model):
+    """Additional user profile information used by the frontend."""
+
     GENDER_CHOICES = [
         ('male', 'Male'),
         ('female', 'Female'),
@@ -73,5 +87,5 @@ class UserProfile(models.Model):
         default='prefer_not_to_say',
     )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"Profile for {self.user.username}"

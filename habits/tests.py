@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -48,6 +49,10 @@ class HabitApiTests(APITestCase):
 		self.assertEqual(token_response.status_code, status.HTTP_200_OK)
 		access = token_response.data['access']
 		self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+
+	def sunday_for_management(self):
+		offset = (6 - self.today.weekday()) % 7
+		return self.today + timedelta(days=offset)
 
 	def test_register_user(self):
 		payload = {
@@ -208,11 +213,12 @@ class HabitApiTests(APITestCase):
 			status='done',
 		)
 
-		patch_response = self.client.patch(
-			f'/api/habits/{self.habit_user_1.id}/',
-			{'days': ['tuesday', 'wednesday', 'thursday', 'friday']},
-			format='json',
-		)
+		with patch('habits.views.timezone.localdate', return_value=self.sunday_for_management()):
+			patch_response = self.client.patch(
+				f'/api/habits/{self.habit_user_1.id}/',
+				{'days': ['tuesday', 'wednesday', 'thursday', 'friday']},
+				format='json',
+			)
 		self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
 
 		weekly_response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
@@ -239,7 +245,9 @@ class HabitApiTests(APITestCase):
 
 		response = self.client.get('/api/habits/history/?days=30')
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
-		self.assertEqual(response.data['daily'], [])
+		self.assertEqual(len(response.data['daily']), 1)
+		self.assertIsNone(response.data['daily'][0]['completion'])
+		self.assertEqual(response.data['daily'][0]['total'], 0)
 		self.assertIsNone(response.data['summary']['average_daily_completion'])
 
 	def test_weekly_returns_null_percentages_before_metrics_baseline(self):
@@ -341,7 +349,8 @@ class HabitApiTests(APITestCase):
 		self.assertEqual(response_before.status_code, status.HTTP_200_OK)
 		self.assertEqual(response_before.data['daily'][0]['completion'], 50)
 
-		delete_response = self.client.delete(f'/api/habits/{second_habit.id}/')
+		with patch('habits.views.timezone.localdate', return_value=self.sunday_for_management()):
+			delete_response = self.client.delete(f'/api/habits/{second_habit.id}/')
 		self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
 
 		response_after = self.client.get(f'/api/habits/history/?start_date={self.today}&end_date={self.today}')

@@ -1,7 +1,10 @@
+"""API views and metric helpers for the habit tracking backend."""
+
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 from django.contrib.auth.models import User
+from django.db.models import Prefetch
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -21,15 +24,48 @@ from .serializers import (
 )
 
 
+def _error_payload(message, code=None, **extra):
+    """Return backward-compatible error payload structure.
+
+    Keeps `error` for existing clients and adds `detail` for DRF-consistent parsing.
+    """
+    payload = {"error": message, "detail": message}
+    if code:
+        payload["code"] = code
+    if extra:
+        payload.update(extra)
+    return payload
+
+
 def _build_schedule_map(habits):
-    schedules = HabitSchedule.objects.filter(habit__in=habits).order_by('effective_from')
+    """Build a dictionary of schedule snapshots by habit id.
+
+    Uses prefetched `schedules` relation when available to avoid extra queries.
+    """
+    if not habits:
+        return defaultdict(list)
+
     schedule_map = defaultdict(list)
+
+    prefetched = True
+    for habit in habits:
+        prefetched_entries = getattr(habit, '_prefetched_objects_cache', {}).get('schedules')
+        if prefetched_entries is None:
+            prefetched = False
+            break
+        schedule_map[habit.id] = sorted(prefetched_entries, key=lambda item: item.effective_from)
+
+    if prefetched:
+        return schedule_map
+
+    schedules = HabitSchedule.objects.filter(habit__in=habits).order_by('effective_from')
     for schedule in schedules:
         schedule_map[schedule.habit_id].append(schedule)
     return schedule_map
 
 
 def _days_for_habit_on_date(habit, target_date, schedule_map):
+    """Resolve active weekdays for a habit on a target date."""
     entries = schedule_map.get(habit.id, [])
     days = habit.days
     for schedule in entries:
@@ -41,6 +77,7 @@ def _days_for_habit_on_date(habit, target_date, schedule_map):
 
 
 def _metrics_baseline_date(user, habit_list):
+    """Return the baseline date used for metric visibility."""
     if not user.date_joined:
         user_start = timezone.localdate()
     else:
@@ -50,6 +87,7 @@ def _metrics_baseline_date(user, habit_list):
 
 
 def _registration_week_start(user):
+    """Return Monday of the week where the account was created."""
     if not user.date_joined:
         return timezone.localdate() - timedelta(days=timezone.localdate().weekday())
 
@@ -58,6 +96,7 @@ def _registration_week_start(user):
 
 
 def _habit_is_active_on_date(habit, target_date):
+    """Determine if a habit is active on a given date."""
     if target_date < habit.start_date:
         return False
     if habit.archived_at and target_date >= habit.archived_at:
@@ -65,9 +104,16 @@ def _habit_is_active_on_date(habit, target_date):
     return True
 
 
-def _compute_range_metrics(user, start_date, end_date):
-    habits = Habit.objects.filter(user=user)
-    habit_list = list(habits)
+def _compute_range_metrics(user, start_date, end_date, habit_list=None, schedule_map=None, logs_map=None):
+    """Compute daily, weekly, and monthly completion metrics for a date range.
+
+    Optional preloaded collections can be passed to reduce repeated queries.
+    """
+    if habit_list is None:
+        habit_list = list(Habit.objects.filter(user=user))
+    else:
+        habit_list = list(habit_list)
+
     baseline = _metrics_baseline_date(user, habit_list)
 
     if not habit_list:
@@ -109,13 +155,14 @@ def _compute_range_metrics(user, start_date, end_date):
         dates.append(cursor)
         cursor += timedelta(days=1)
 
-    schedule_map = _build_schedule_map(habit_list)
+    schedule_map = schedule_map or _build_schedule_map(habit_list)
 
-    logs = HabitLog.objects.filter(
-        habit__user=user,
-        date__range=(effective_start, end_date),
-    )
-    logs_map = {(log.habit_id, log.date): log.status for log in logs}
+    if logs_map is None:
+        logs = HabitLog.objects.filter(
+            habit__user=user,
+            date__range=(effective_start, end_date),
+        )
+        logs_map = {(log.habit_id, log.date): log.status for log in logs}
 
     daily_rows = []
     weekly_agg = defaultdict(lambda: {"done": 0, "total": 0})
@@ -206,6 +253,7 @@ def _compute_range_metrics(user, start_date, end_date):
 
 
 def _overall_completion(rows):
+    """Calculate weighted overall completion from metric rows."""
     total_done = sum(row.get("done", 0) for row in rows if row.get("total", 0) > 0)
     total_applicable = sum(row.get("total", 0) for row in rows if row.get("total", 0) > 0)
 
@@ -216,6 +264,7 @@ def _overall_completion(rows):
 
 
 def _compute_habit_streaks(habit, schedule_map, logs_map, end_date):
+    """Compute current and best streak for a habit up to a target date."""
     applicable_dates = []
     cursor = habit.start_date
 
@@ -254,16 +303,21 @@ def _compute_habit_streaks(habit, schedule_map, logs_map, end_date):
 
 
 class HabitViewSet(viewsets.ModelViewSet):
+    """CRUD endpoints and analytics actions for user habits."""
+
     serializer_class = HabitSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        """Return active habits for the authenticated user."""
         return Habit.objects.filter(user=self.request.user, is_archived=False)
 
     def perform_create(self, serializer):
+        """Attach authenticated user to newly created habit."""
         serializer.save(user=self.request.user)
 
     def _require_sunday(self):
+        """Enforce Sunday-only updates/deletes for habit definitions."""
         if timezone.localdate().weekday() != 6:
             return Response(
                 {"detail": "You can only edit or delete habits on Sunday."},
@@ -296,15 +350,16 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='by-date')
     def by_date(self, request):
+        """Return user habits scheduled for a specific date with their status."""
         date_str = request.query_params.get('date')
 
         if not date_str:
-            return Response({"error": "Date is required"}, status=400)
+            return Response(_error_payload("Date is required", code="date_required"), status=400)
 
         try:
             date = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
-            return Response({"error": "Invalid date format"}, status=400)
+            return Response(_error_payload("Invalid date format", code="invalid_date_format"), status=400)
 
         weekday = date.strftime("%A").lower()
 
@@ -337,15 +392,16 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='weekly')
     def weekly(self, request):
+        """Return weekly habit matrix plus aggregate completion metrics."""
         start_date_str = request.query_params.get('start_date')
 
         if not start_date_str:
-            return Response({"error": "start_date is required"}, status=400)
+            return Response(_error_payload("start_date is required", code="start_date_required"), status=400)
 
         try:
             start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
         except ValueError:
-            return Response({"error": "Invalid date format"}, status=400)
+            return Response(_error_payload("Invalid date format", code="invalid_date_format"), status=400)
 
         week_dates = [start_date + timedelta(days=i) for i in range(7)]
         registration_week_start = _registration_week_start(request.user)
@@ -353,7 +409,10 @@ class HabitViewSet(viewsets.ModelViewSet):
         if start_date < registration_week_start:
             return Response(
                 {
-                    "error": "Weeks before your registration date are not available.",
+                    **_error_payload(
+                        "Weeks before your registration date are not available.",
+                        code="registration_week_floor",
+                    ),
                     "earliest_week_start": str(registration_week_start),
                 },
                 status=400,
@@ -462,6 +521,7 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='tracker-metrics')
     def tracker_metrics(self, request):
+        """Return compact tracker metrics for the selected week."""
         today = timezone.localdate()
         current_week_start = today - timedelta(days=today.weekday())
         registration_week_start = _registration_week_start(request.user)
@@ -471,7 +531,7 @@ class HabitViewSet(viewsets.ModelViewSet):
             try:
                 week_start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
             except ValueError:
-                return Response({"error": "Invalid start_date format"}, status=400)
+                return Response(_error_payload("Invalid start_date format", code="invalid_start_date"), status=400)
             week_start = week_start - timedelta(days=week_start.weekday())
         else:
             week_start = current_week_start
@@ -479,14 +539,17 @@ class HabitViewSet(viewsets.ModelViewSet):
         if week_start < registration_week_start:
             return Response(
                 {
-                    "error": "Weeks before your registration date are not available.",
+                    **_error_payload(
+                        "Weeks before your registration date are not available.",
+                        code="registration_week_floor",
+                    ),
                     "earliest_week_start": str(registration_week_start),
                 },
                 status=400,
             )
 
         if week_start > current_week_start:
-            return Response({"error": "Future weeks are not allowed"}, status=400)
+            return Response(_error_payload("Future weeks are not allowed", code="future_week_not_allowed"), status=400)
 
         week_end = week_start + timedelta(days=6)
         focus_date = min(week_end, today)
@@ -520,6 +583,7 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='history')
     def history(self, request):
+        """Return historical metric series for custom or preset ranges."""
         end_date_str = request.query_params.get('end_date')
         start_date_str = request.query_params.get('start_date')
         days_str = request.query_params.get('days', '90')
@@ -531,41 +595,95 @@ class HabitViewSet(viewsets.ModelViewSet):
                 else timezone.localdate()
             )
         except ValueError:
-            return Response({"error": "Invalid end_date format"}, status=400)
+            return Response(_error_payload("Invalid end_date format", code="invalid_end_date"), status=400)
 
         if start_date_str:
             try:
                 start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
             except ValueError:
-                return Response({"error": "Invalid start_date format"}, status=400)
+                return Response(_error_payload("Invalid start_date format", code="invalid_start_date"), status=400)
         else:
             try:
                 days = max(7, min(365, int(days_str)))
             except ValueError:
-                return Response({"error": "days must be a valid integer"}, status=400)
+                return Response(_error_payload("days must be a valid integer", code="invalid_days"), status=400)
             start_date = end_date - timedelta(days=days - 1)
 
         if start_date > end_date:
-            return Response({"error": "start_date must be before end_date"}, status=400)
+            return Response(_error_payload("start_date must be before end_date", code="invalid_range"), status=400)
 
         payload = _compute_range_metrics(request.user, start_date, end_date)
         return Response(payload)
 
     @action(detail=False, methods=['get'], url_path='leaderboard')
     def leaderboard(self, request):
+        """Return ranking metrics for all non-superuser accounts.
+
+        Uses relationship prefetching to avoid repeated queries per user.
+        """
         today = timezone.localdate()
         week_start = today - timedelta(days=today.weekday())
         month_start = today.replace(day=1)
 
         ranking = []
-        for user in User.objects.all().order_by('id'):
-            if user.is_superuser:
-                continue
+        users = User.objects.filter(is_superuser=False).order_by('id').select_related('profile').prefetch_related(
+            Prefetch(
+                'habit_set',
+                queryset=Habit.objects.all().prefetch_related('schedules', 'habitlog_set'),
+            )
+        )
 
-            daily_metrics = _compute_range_metrics(user, today, today)
-            weekly_metrics = _compute_range_metrics(user, week_start, today)
-            monthly_metrics = _compute_range_metrics(user, month_start, today)
-            overall_metrics = _compute_range_metrics(user, _metrics_baseline_date(user, list(Habit.objects.filter(user=user))), today)
+        for user in users:
+            habit_list = list(user.habit_set.all())
+            schedule_map = _build_schedule_map(habit_list)
+
+            all_logs = []
+            for habit in habit_list:
+                prefetched_logs = getattr(habit, '_prefetched_objects_cache', {}).get('habitlog_set')
+                if prefetched_logs is None:
+                    prefetched_logs = habit.habitlog_set.all()
+                all_logs.extend(prefetched_logs)
+
+            def logs_map_for_range(range_start, range_end):
+                return {
+                    (log.habit_id, log.date): log.status
+                    for log in all_logs
+                    if range_start <= log.date <= range_end
+                }
+
+            baseline_date = _metrics_baseline_date(user, habit_list)
+            daily_metrics = _compute_range_metrics(
+                user,
+                today,
+                today,
+                habit_list=habit_list,
+                schedule_map=schedule_map,
+                logs_map=logs_map_for_range(today, today),
+            )
+            weekly_metrics = _compute_range_metrics(
+                user,
+                week_start,
+                today,
+                habit_list=habit_list,
+                schedule_map=schedule_map,
+                logs_map=logs_map_for_range(week_start, today),
+            )
+            monthly_metrics = _compute_range_metrics(
+                user,
+                month_start,
+                today,
+                habit_list=habit_list,
+                schedule_map=schedule_map,
+                logs_map=logs_map_for_range(month_start, today),
+            )
+            overall_metrics = _compute_range_metrics(
+                user,
+                baseline_date,
+                today,
+                habit_list=habit_list,
+                schedule_map=schedule_map,
+                logs_map=logs_map_for_range(baseline_date, today),
+            )
 
             daily_rows = daily_metrics.get('daily', [])
             daily_row = daily_rows[0] if daily_rows else None
@@ -675,6 +793,8 @@ class HabitViewSet(viewsets.ModelViewSet):
 
 
 class HabitLogViewSet(viewsets.ModelViewSet):
+    """Endpoint for user-scoped habit log reads and upserts."""
+
     serializer_class = HabitLogSerializer
     permission_classes = [IsAuthenticated]
 
@@ -715,6 +835,8 @@ class HabitLogViewSet(viewsets.ModelViewSet):
 
 
 class RegisterView(APIView):
+    """Public endpoint for account creation."""
+
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -725,6 +847,8 @@ class RegisterView(APIView):
 
 
 class ProfileView(APIView):
+    """Authenticated endpoint to read and update the current user profile."""
+
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -746,4 +870,6 @@ class ProfileView(APIView):
 
 
 class CaseInsensitiveTokenObtainPairView(TokenObtainPairView):
+    """JWT token endpoint using case-insensitive username auth serializer."""
+
     serializer_class = CaseInsensitiveTokenObtainPairSerializer

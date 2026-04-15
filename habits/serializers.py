@@ -1,3 +1,5 @@
+"""Serializers for habit tracking API endpoints."""
+
 from django.contrib.auth.models import User
 from django.utils import timezone
 from rest_framework import serializers
@@ -18,6 +20,8 @@ VALID_DAYS = {
 }
 
 class HabitSerializer(serializers.ModelSerializer):
+    """Serialize habits and enforce weekday list consistency."""
+
     days = serializers.ListField(child=serializers.CharField())
 
     class Meta:
@@ -80,6 +84,8 @@ class HabitSerializer(serializers.ModelSerializer):
         return updated_instance
 
 class HabitLogSerializer(serializers.ModelSerializer):
+    """Serialize persisted habit logs."""
+
     class Meta:
         model = HabitLog
         fields = '__all__'
@@ -87,6 +93,8 @@ class HabitLogSerializer(serializers.ModelSerializer):
 
 
 class HabitLogUpsertSerializer(serializers.Serializer):
+    """Validate upsert payload for per-day habit status updates."""
+
     habit = serializers.PrimaryKeyRelatedField(queryset=Habit.objects.all())
     date = serializers.DateField()
     status = serializers.ChoiceField(
@@ -116,6 +124,8 @@ class HabitLogUpsertSerializer(serializers.Serializer):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
+    """Register users with case-insensitive uniqueness checks."""
+
     password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta:
@@ -144,6 +154,8 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
+    """Serialize and validate editable profile fields for authenticated users."""
+
     first_name = serializers.CharField(source='user.first_name', allow_blank=True, required=False)
     last_name = serializers.CharField(source='user.last_name', allow_blank=True, required=False)
     email = serializers.EmailField(source='user.email', required=False)
@@ -177,6 +189,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
     def validate_avatar(self, image):
+        """Validate avatar mime type and max file size."""
         if image is None:
             return image
 
@@ -190,6 +203,22 @@ class UserProfileSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Avatar image must be 2MB or smaller.')
 
         return image
+
+    def validate_birth_date(self, value):
+        """Ensure birth date is not set in the future."""
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError('Birth date cannot be in the future.')
+        return value
+
+    def validate_weight_kg(self, value):
+        """Enforce a sane positive range for body weight."""
+        if value is None:
+            return value
+        if value <= 0:
+            raise serializers.ValidationError('Weight must be greater than zero.')
+        if value > 500:
+            raise serializers.ValidationError('Weight value looks unrealistic. Use kilograms.')
+        return value
 
     def update(self, instance, validated_data):
         remove_avatar = validated_data.pop('remove_avatar', False)
@@ -213,6 +242,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class CaseInsensitiveTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """Authenticate with case-insensitive username matching."""
+
     default_error_messages = {
         "no_active_account": "No active account found with the given credentials."
     }
