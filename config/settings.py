@@ -14,6 +14,13 @@ from datetime import timedelta
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
+try:
+    import dj_database_url
+except ImportError:  # pragma: no cover - fallback for local minimal setups
+    dj_database_url = None
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -24,7 +31,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV = os.getenv('ENV', 'development').lower()
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('SECRET_KEY', 'dev-only-insecure-key-change-me')
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    raise ImproperlyConfigured('SECRET_KEY environment variable is required.')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'true').lower() == 'true'
@@ -48,6 +57,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'habits',
     'corsheaders',
 ]
@@ -55,12 +65,14 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'config.security_headers.SecurityHeadersMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -92,6 +104,15 @@ DATABASES = {
         'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
+
+if ENV == 'production':
+    database_url = os.getenv('DATABASE_URL')
+    if not database_url:
+        raise ImproperlyConfigured('DATABASE_URL is required in production.')
+    if dj_database_url is None:
+        raise ImproperlyConfigured('dj-database-url is required to parse DATABASE_URL in production.')
+
+    DATABASES['default'] = dj_database_url.parse(database_url, conn_max_age=600)
 
 
 # Password validation
@@ -130,6 +151,7 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
@@ -147,18 +169,35 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'anon': os.getenv('DRF_THROTTLE_ANON', '60/min'),
         'user': os.getenv('DRF_THROTTLE_USER', '180/min'),
+        'auth_login': os.getenv('DRF_THROTTLE_AUTH_LOGIN', '10/min'),
+        'auth_register': os.getenv('DRF_THROTTLE_AUTH_REGISTER', '5/min'),
     },
+    'EXCEPTION_HANDLER': 'habits.exceptions.api_exception_handler',
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv('JWT_ACCESS_MINUTES', '20'))),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': os.getenv('JWT_ROTATE_REFRESH_TOKENS', 'true').lower() == 'true',
     'BLACKLIST_AFTER_ROTATION': os.getenv('JWT_BLACKLIST_AFTER_ROTATION', 'false').lower() == 'true',
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
+AUTH_REFRESH_COOKIE = os.getenv('AUTH_REFRESH_COOKIE', 'habit_tracker_refresh')
+AUTH_REFRESH_COOKIE_PATH = os.getenv('AUTH_REFRESH_COOKIE_PATH', '/api/token/refresh/')
+AUTH_REFRESH_COOKIE_MAX_AGE = int(os.getenv('AUTH_REFRESH_COOKIE_MAX_AGE', str(7 * 24 * 60 * 60)))
+AUTH_REFRESH_COOKIE_SAMESITE = os.getenv(
+    'AUTH_REFRESH_COOKIE_SAMESITE',
+    'Strict' if ENV == 'production' else 'Lax',
+)
+AUTH_REFRESH_COOKIE_SECURE = os.getenv('AUTH_REFRESH_COOKIE_SECURE', 'false').lower() == 'true'
+AUTH_REFRESH_COOKIE_HTTP_ONLY = True
+LEADERBOARD_CACHE_TTL = int(os.getenv('LEADERBOARD_CACHE_TTL', '600'))
+LEADERBOARD_TOP_RESULTS = int(os.getenv('LEADERBOARD_TOP_RESULTS', '20'))
+LEADERBOARD_LEADERS_LIMIT = int(os.getenv('LEADERBOARD_LEADERS_LIMIT', '10'))
+
 CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'false').lower() == 'true'
+CORS_ALLOW_CREDENTIALS = os.getenv('CORS_ALLOW_CREDENTIALS', 'true').lower() == 'true'
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
@@ -187,5 +226,58 @@ if ENV == 'production':
     SECURE_HSTS_PRELOAD = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
+    AUTH_REFRESH_COOKIE_SECURE = True
+    AUTH_REFRESH_COOKIE_SAMESITE = os.getenv('AUTH_REFRESH_COOKIE_SAMESITE', 'Strict')
+
+if ENV == 'production' and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured('ALLOWED_HOSTS must be set in production.')
+
+SECURE_REFERRER_POLICY = os.getenv('SECURE_REFERRER_POLICY', 'strict-origin-when-cross-origin')
+
+CSP_DEFAULT_SRC = os.getenv('CSP_DEFAULT_SRC', "'self'")
+CSP_SCRIPT_SRC = os.getenv('CSP_SCRIPT_SRC', "'self'")
+CSP_STYLE_SRC = os.getenv('CSP_STYLE_SRC', "'self' 'unsafe-inline'")
+CSP_IMG_SRC = os.getenv('CSP_IMG_SRC', "'self' data: blob:")
+CSP_CONNECT_SRC = os.getenv('CSP_CONNECT_SRC', "'self'")
+CSP_FONT_SRC = os.getenv('CSP_FONT_SRC', "'self' data:")
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'habit-tracker-default',
+    }
+}
+
+redis_url = os.getenv('REDIS_URL')
+if redis_url:
+    CACHES['default'] = {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': redis_url,
+        'OPTIONS': {
+            'socket_connect_timeout': 5,
+            'socket_timeout': 5,
+        },
+    }
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'json': {
+            'format': '{{"time":"{asctime}","level":"{levelname}","logger":"{name}","message":"{message}"}}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'json',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': os.getenv('LOG_LEVEL', 'INFO'),
+    },
+}
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

@@ -4,14 +4,20 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 from django.contrib.auth.models import User
-from django.db.models import Prefetch
+from django.core.cache import cache
+from django.db.models import Count, F, FloatField, Q, Value
+from django.db.models.expressions import ExpressionWrapper
+from django.db.models.functions import Coalesce, NullIf
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from django.utils import timezone
+from django.conf import settings
 
 from .models import Habit, HabitLog, HabitSchedule, UserProfile
 from .serializers import (
@@ -22,6 +28,7 @@ from .serializers import (
     RegisterSerializer,
     UserProfileSerializer,
 )
+from .throttles import LoginRateThrottle, RegisterRateThrottle
 
 
 def _error_payload(message, code=None, **extra):
@@ -35,6 +42,17 @@ def _error_payload(message, code=None, **extra):
     if extra:
         payload.update(extra)
     return payload
+
+
+def _invalidate_leaderboard_cache(target_date=None):
+    """Invalidate leaderboard cache entries for a given date.
+
+    Ranking payloads are cached by day key (leaderboard:v2:YYYY-MM-DD).
+    """
+    date_value = target_date or timezone.localdate()
+    cache_key = f"leaderboard:v2:{date_value.isoformat()}"
+    cache.delete(cache_key)
+    cache.delete(f"{cache_key}:lock")
 
 
 def _build_schedule_map(habits):
@@ -162,7 +180,7 @@ def _compute_range_metrics(user, start_date, end_date, habit_list=None, schedule
             habit__user=user,
             date__range=(effective_start, end_date),
         )
-        logs_map = {(log.habit_id, log.date): log.status for log in logs}
+        logs_map = {(log.habit_id, str(log.date)): log.status for log in logs}
 
     daily_rows = []
     weekly_agg = defaultdict(lambda: {"done": 0, "total": 0})
@@ -182,7 +200,7 @@ def _compute_range_metrics(user, start_date, end_date, habit_list=None, schedule
                 continue
 
             total_count += 1
-            status_value = logs_map.get((habit.id, current_date))
+            status_value = logs_map.get((habit.id, str(current_date)))
             if status_value == "done":
                 done_count += 1
 
@@ -315,6 +333,12 @@ class HabitViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Attach authenticated user to newly created habit."""
         serializer.save(user=self.request.user)
+        _invalidate_leaderboard_cache()
+
+    def perform_update(self, serializer):
+        """Persist habit updates and invalidate ranking cache."""
+        serializer.save()
+        _invalidate_leaderboard_cache()
 
     def _require_sunday(self):
         """Enforce Sunday-only updates/deletes for habit definitions."""
@@ -341,6 +365,7 @@ class HabitViewSet(viewsets.ModelViewSet):
         instance.is_archived = True
         instance.archived_at = timezone.localdate() + timedelta(days=1)
         instance.save(update_fields=['is_archived', 'archived_at'])
+        _invalidate_leaderboard_cache()
 
     def destroy(self, request, *args, **kwargs):
         sunday_check = self._require_sunday()
@@ -617,145 +642,141 @@ class HabitViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='leaderboard')
     def leaderboard(self, request):
-        """Return ranking metrics for all non-superuser accounts.
+        """Return ranking metrics using schedule-aware calculations."""
+        cache_key = f"leaderboard:v2:{timezone.localdate().isoformat()}"
+        cache_ttl = int(getattr(settings, 'LEADERBOARD_CACHE_TTL', 600))
+        lock_key = f"{cache_key}:lock"
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            response = Response(cached_payload)
+            response['Cache-Control'] = f'private, max-age={cache_ttl}'
+            return response
 
-        Uses relationship prefetching to avoid repeated queries per user.
-        """
-        today = timezone.localdate()
-        week_start = today - timedelta(days=today.weekday())
-        month_start = today.replace(day=1)
+        lock_acquired = cache.add(lock_key, '1', timeout=30)
+        if not lock_acquired:
+            cached_payload = cache.get(cache_key)
+            if cached_payload is not None:
+                response = Response(cached_payload)
+                response['Cache-Control'] = f'private, max-age={cache_ttl}'
+                return response
 
-        ranking = []
-        users = User.objects.filter(is_superuser=False).order_by('id').select_related('profile').prefetch_related(
-            Prefetch(
-                'habit_set',
-                queryset=Habit.objects.all().prefetch_related('schedules', 'habitlog_set'),
-            )
-        )
+        try:
+            today = timezone.localdate()
+            week_start = today - timedelta(days=today.weekday())
+            month_start = today.replace(day=1)
 
-        for user in users:
-            habit_list = list(user.habit_set.all())
-            schedule_map = _build_schedule_map(habit_list)
+            top_limit = int(getattr(settings, 'LEADERBOARD_TOP_RESULTS', 20))
+            leaders_limit = int(getattr(settings, 'LEADERBOARD_LEADERS_LIMIT', 10))
 
-            all_logs = []
-            for habit in habit_list:
-                prefetched_logs = getattr(habit, '_prefetched_objects_cache', {}).get('habitlog_set')
-                if prefetched_logs is None:
-                    prefetched_logs = habit.habitlog_set.all()
-                all_logs.extend(prefetched_logs)
+            # Get all non-superuser users with habits
+            users = User.objects.filter(is_superuser=False).prefetch_related(
+                'habit_set__schedules'
+            ).select_related('profile')
 
-            def logs_map_for_range(range_start, range_end):
-                return {
-                    (log.habit_id, log.date): log.status
-                    for log in all_logs
-                    if range_start <= log.date <= range_end
-                }
+            # Calculate schedule-aware metrics for each user
+            user_metrics = []
+            for user in users:
+                habits = list(Habit.objects.filter(user=user, is_archived=False))
+                if not habits:
+                    continue
 
-            baseline_date = _metrics_baseline_date(user, habit_list)
-            daily_metrics = _compute_range_metrics(
-                user,
-                today,
-                today,
-                habit_list=habit_list,
-                schedule_map=schedule_map,
-                logs_map=logs_map_for_range(today, today),
-            )
-            weekly_metrics = _compute_range_metrics(
-                user,
-                week_start,
-                today,
-                habit_list=habit_list,
-                schedule_map=schedule_map,
-                logs_map=logs_map_for_range(week_start, today),
-            )
-            monthly_metrics = _compute_range_metrics(
-                user,
-                month_start,
-                today,
-                habit_list=habit_list,
-                schedule_map=schedule_map,
-                logs_map=logs_map_for_range(month_start, today),
-            )
-            overall_metrics = _compute_range_metrics(
-                user,
-                baseline_date,
-                today,
-                habit_list=habit_list,
-                schedule_map=schedule_map,
-                logs_map=logs_map_for_range(baseline_date, today),
-            )
+                schedule_map = _build_schedule_map(habits)
+                logs = HabitLog.objects.filter(habit__user=user).order_by('date')
+                logs_map = {(log.habit_id, str(log.date)): log.status for log in logs}
 
-            daily_rows = daily_metrics.get('daily', [])
-            daily_row = daily_rows[0] if daily_rows else None
-            daily_completion = daily_row.get('completion') if daily_row else None
+                # Daily metrics
+                daily_metrics = _compute_range_metrics(
+                    user, today, today, habits, schedule_map, logs_map
+                )
+                daily_completion = daily_metrics['daily'][0]['completion'] if daily_metrics['daily'] else 0
 
-            daily_total = sum(row.get('total', 0) for row in daily_rows if row.get('total', 0) > 0)
-            daily_done = sum(row.get('done', 0) for row in daily_rows if row.get('total', 0) > 0)
-            daily_completion = (
-                round((daily_done / daily_total) * 100, 0)
-                if daily_total > 0
-                else None
-            )
+                # Weekly metrics
+                weekly_metrics = _compute_range_metrics(
+                    user, week_start, today, habits, schedule_map, logs_map
+                )
+                weekly_completion = _overall_completion(weekly_metrics['daily']) or 0
 
-            weekly_done = sum(row.get('done', 0) for row in weekly_metrics.get('daily', []))
-            weekly_total = sum(row.get('total', 0) for row in weekly_metrics.get('daily', []))
-            weekly_completion = (
-                round((weekly_done / weekly_total) * 100, 0)
-                if weekly_total > 0
-                else None
-            )
+                # Monthly metrics
+                monthly_metrics = _compute_range_metrics(
+                    user, month_start, today, habits, schedule_map, logs_map
+                )
+                monthly_completion = _overall_completion(monthly_metrics['daily']) or 0
 
-            monthly_done = sum(row.get('done', 0) for row in monthly_metrics.get('daily', []))
-            monthly_total = sum(row.get('total', 0) for row in monthly_metrics.get('daily', []))
-            monthly_completion = (
-                round((monthly_done / monthly_total) * 100, 0)
-                if monthly_total > 0
-                else None
+                # Historical metrics
+                baseline = _metrics_baseline_date(user, habits)
+                historical_metrics = _compute_range_metrics(
+                    user, baseline, today, habits, schedule_map, logs_map
+                )
+                historical_completion = _overall_completion(historical_metrics['daily']) or 0
+
+                # Only include users with some activity
+                if daily_completion or weekly_completion or monthly_completion or historical_completion:
+                    user_metrics.append({
+                        'user': user,
+                        'daily_completion': daily_completion or 0,
+                        'weekly_completion': weekly_completion or 0,
+                        'monthly_completion': monthly_completion or 0,
+                        'historical_completion': historical_completion or 0,
+                    })
+
+            # Sort by completion metrics (daily primary, then weekly, monthly, historical as tiebreaker)
+            user_metrics.sort(
+                key=lambda x: (
+                    -x['daily_completion'],
+                    -x['weekly_completion'],
+                    -x['monthly_completion'],
+                    -x['historical_completion'],
+                    x['user'].username,
+                )
             )
 
-            historical_completion = _overall_completion(overall_metrics.get('daily', []))
+            # Build ranking results
+            ranking = []
+            for metric in user_metrics[:top_limit]:
+                user = metric['user']
+                profile = getattr(user, 'profile', None)
+                avatar_url = None
+                if profile and profile.avatar:
+                    avatar_url = request.build_absolute_uri(profile.avatar.url)
 
-            if daily_completion is None and weekly_completion is None and monthly_completion is None:
-                continue
-
-            profile = getattr(user, 'profile', None)
-            avatar_url = None
-            if profile and profile.avatar:
-                avatar_url = request.build_absolute_uri(profile.avatar.url)
-
-            ranking.append(
-                {
+                ranking.append({
                     'username': user.username,
                     'display_name': (user.first_name or '').strip() or user.username,
                     'avatar_file_url': avatar_url,
-                    'daily_completion': daily_completion,
-                    'weekly_completion': weekly_completion,
-                    'monthly_completion': monthly_completion,
-                    'historical_completion': historical_completion,
+                    'daily_completion': round(metric['daily_completion'], 0),
+                    'weekly_completion': round(metric['weekly_completion'], 0),
+                    'monthly_completion': round(metric['monthly_completion'], 0),
+                    'historical_completion': round(metric['historical_completion'], 0),
+                })
+
+            total_ranked_users = len(user_metrics)
+
+            # Build metric leaders
+            metric_leaders = {}
+            for metric_key in ['daily_completion', 'weekly_completion', 'historical_completion']:
+                if not user_metrics:
+                    metric_leaders[metric_key] = {'score': None, 'leaders': []}
+                    continue
+
+                top_score = user_metrics[0][metric_key]
+                leaders = [
+                    m for m in user_metrics
+                    if abs(m[metric_key] - top_score) < 0.5
+                ][:leaders_limit]
+
+                metric_leaders[metric_key] = {
+                    'score': round(top_score, 0),
+                    'leaders': [
+                        {
+                            'username': m['user'].username,
+                            'display_name': (m['user'].first_name or '').strip() or m['user'].username,
+                            metric_key: round(m[metric_key], 0),
+                        }
+                        for m in leaders
+                    ],
                 }
-            )
 
-        ranking.sort(
-            key=lambda row: (
-                row['daily_completion'] if row['daily_completion'] is not None else -1,
-                row['weekly_completion'] if row['weekly_completion'] is not None else -1,
-                row['monthly_completion'] if row['monthly_completion'] is not None else -1,
-                row['historical_completion'] if row['historical_completion'] is not None else -1,
-                row['display_name'].lower(),
-            ),
-            reverse=True,
-        )
-
-        daily_top = next((row['daily_completion'] for row in ranking if row['daily_completion'] is not None), None)
-        weekly_top = next((row['weekly_completion'] for row in ranking if row['weekly_completion'] is not None), None)
-        historical_top = next((row['historical_completion'] for row in ranking if row['historical_completion'] is not None), None)
-
-        daily_leaders = [row for row in ranking if row['daily_completion'] == daily_top] if daily_top is not None else []
-        weekly_leaders = [row for row in ranking if row['weekly_completion'] == weekly_top] if weekly_top is not None else []
-        historical_leaders = [row for row in ranking if row['historical_completion'] == historical_top] if historical_top is not None else []
-
-        return Response(
-            {
+            payload = {
                 'range': {
                     'day': {
                         'start_date': str(today),
@@ -772,24 +793,32 @@ class HabitViewSet(viewsets.ModelViewSet):
                 },
                 'highlights': {
                     'daily': {
-                        'score': daily_top,
-                        'leaders': daily_leaders,
-                        'total': len(ranking),
+                        'score': metric_leaders['daily_completion']['score'],
+                        'leaders': metric_leaders['daily_completion']['leaders'],
+                        'total': total_ranked_users,
                     },
                     'weekly': {
-                        'score': weekly_top,
-                        'leaders': weekly_leaders,
-                        'total': len(ranking),
+                        'score': metric_leaders['weekly_completion']['score'],
+                        'leaders': metric_leaders['weekly_completion']['leaders'],
+                        'total': total_ranked_users,
                     },
                     'historical': {
-                        'score': historical_top,
-                        'leaders': historical_leaders,
-                        'total': len(ranking),
+                        'score': metric_leaders['historical_completion']['score'],
+                        'leaders': metric_leaders['historical_completion']['leaders'],
+                        'total': total_ranked_users,
                     },
                 },
-                'results': ranking[:20],
+                'results': ranking,
             }
-        )
+
+            cache.set(cache_key, payload, timeout=cache_ttl)
+        finally:
+            if lock_acquired:
+                cache.delete(lock_key)
+
+        response = Response(payload)
+        response['Cache-Control'] = f'private, max-age={cache_ttl}'
+        return response
 
 
 class HabitLogViewSet(viewsets.ModelViewSet):
@@ -814,6 +843,7 @@ class HabitLogViewSet(viewsets.ModelViewSet):
 
         if status_value == "pending":
             HabitLog.objects.filter(habit=habit, date=log_date).delete()
+            _invalidate_leaderboard_cache()
             return Response(
                 {
                     "habit": habit.id,
@@ -828,6 +858,7 @@ class HabitLogViewSet(viewsets.ModelViewSet):
             date=log_date,
             defaults={"status": status_value}
         )
+        _invalidate_leaderboard_cache()
 
         serializer = self.get_serializer(log)
         response_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
@@ -838,6 +869,7 @@ class RegisterView(APIView):
     """Public endpoint for account creation."""
 
     permission_classes = [AllowAny]
+    throttle_classes = [RegisterRateThrottle]
 
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
@@ -872,4 +904,83 @@ class ProfileView(APIView):
 class CaseInsensitiveTokenObtainPairView(TokenObtainPairView):
     """JWT token endpoint using case-insensitive username auth serializer."""
 
+    throttle_classes = [LoginRateThrottle]
     serializer_class = CaseInsensitiveTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        """Issue access token in body and refresh token in HttpOnly cookie."""
+        response = super().post(request, *args, **kwargs)
+
+        refresh_token = response.data.pop('refresh', None)
+        if refresh_token:
+            response.set_cookie(
+                key=settings.AUTH_REFRESH_COOKIE,
+                value=refresh_token,
+                max_age=settings.AUTH_REFRESH_COOKIE_MAX_AGE,
+                httponly=settings.AUTH_REFRESH_COOKIE_HTTP_ONLY,
+                secure=settings.AUTH_REFRESH_COOKIE_SECURE,
+                samesite=settings.AUTH_REFRESH_COOKIE_SAMESITE,
+                path=settings.AUTH_REFRESH_COOKIE_PATH,
+            )
+
+        response['Cache-Control'] = 'no-store'
+        return response
+
+
+class CookieTokenRefreshView(TokenRefreshView):
+    """Refresh access token using HttpOnly refresh-token cookie."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        refresh_value = request.data.get('refresh') or request.COOKIES.get(settings.AUTH_REFRESH_COOKIE)
+        if not refresh_value:
+            return Response(
+                _error_payload('Refresh token not provided.', code='refresh_missing'),
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        serializer = TokenRefreshSerializer(data={'refresh': refresh_value})
+        serializer.is_valid(raise_exception=True)
+        response = Response(serializer.validated_data, status=status.HTTP_200_OK)
+
+        new_refresh = response.data.pop('refresh', None)
+        if new_refresh:
+            response.set_cookie(
+                key=settings.AUTH_REFRESH_COOKIE,
+                value=new_refresh,
+                max_age=settings.AUTH_REFRESH_COOKIE_MAX_AGE,
+                httponly=settings.AUTH_REFRESH_COOKIE_HTTP_ONLY,
+                secure=settings.AUTH_REFRESH_COOKIE_SECURE,
+                samesite=settings.AUTH_REFRESH_COOKIE_SAMESITE,
+                path=settings.AUTH_REFRESH_COOKIE_PATH,
+            )
+
+        response['Cache-Control'] = 'no-store'
+        return response
+
+
+class LogoutView(APIView):
+    """Clear refresh cookie and blacklist refresh token when available."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        refresh_value = request.COOKIES.get(settings.AUTH_REFRESH_COOKIE)
+        if refresh_value:
+            try:
+                token = RefreshToken(refresh_value)
+                token.blacklist()
+            except Exception:
+                # Keep logout idempotent even if token is expired/invalid.
+                pass
+
+        response = Response({'detail': 'Logged out successfully.'}, status=status.HTTP_200_OK)
+        response.delete_cookie(
+            settings.AUTH_REFRESH_COOKIE,
+            path=settings.AUTH_REFRESH_COOKIE_PATH,
+            samesite=settings.AUTH_REFRESH_COOKIE_SAMESITE,
+        )
+        response['Cache-Control'] = 'no-store'
+        return response

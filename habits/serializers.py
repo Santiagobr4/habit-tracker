@@ -1,6 +1,10 @@
 """Serializers for habit tracking API endpoints."""
 
+import re
+
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import AuthenticationFailed
@@ -135,12 +139,26 @@ class RegisterSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         username = attrs["username"].strip()
         email = attrs["email"].strip().lower()
+        password = attrs["password"]
 
         errors = {}
         if User.objects.filter(username__iexact=username).exists():
             errors["username"] = ["This username is already in use."]
         if User.objects.filter(email__iexact=email).exists():
             errors["email"] = ["This email is already in use."]
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        try:
+            validate_password(password, user=User(username=username, email=email))
+        except DjangoValidationError as exc:
+            errors["password"] = list(exc.messages)
+
+        if not re.search(r"[A-Z]", password):
+            errors.setdefault("password", []).append("Password must include at least one uppercase letter.")
+        if not re.search(r"\d", password):
+            errors.setdefault("password", []).append("Password must include at least one number.")
 
         if errors:
             raise serializers.ValidationError(errors)

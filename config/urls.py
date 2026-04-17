@@ -21,12 +21,13 @@ from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 from habits.views import (
     CaseInsensitiveTokenObtainPairView,
+    CookieTokenRefreshView,
     HabitLogViewSet,
     HabitViewSet,
+    LogoutView,
     ProfileView,
     RegisterView,
 )
-from rest_framework_simplejwt.views import TokenRefreshView
 
 router = DefaultRouter()
 
@@ -38,8 +39,9 @@ urlpatterns = [
     path('api/', include(router.urls)),
     path('api/register/', RegisterView.as_view(), name='register'),
     path('api/profile/', ProfileView.as_view(), name='profile'),
+    path('api/logout/', LogoutView.as_view(), name='logout'),
     path('api/token/', CaseInsensitiveTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/token/refresh/', CookieTokenRefreshView.as_view(), name='token_refresh'),
 ]
 
 if settings.DEBUG:

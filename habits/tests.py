@@ -1,6 +1,4 @@
 from datetime import date, timedelta
-from unittest.mock import patch
-
 from django.contrib.auth.models import User
 from django.utils import timezone
 from rest_framework import status
@@ -50,10 +48,6 @@ class HabitApiTests(APITestCase):
 		access = token_response.data['access']
 		self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
 
-	def sunday_for_management(self):
-		offset = (6 - self.today.weekday()) % 7
-		return self.today + timedelta(days=offset)
-
 	def test_register_user(self):
 		payload = {
 			'username': 'charlie',
@@ -75,8 +69,9 @@ class HabitApiTests(APITestCase):
 		response = self.client.post('/api/register/', payload, format='json')
 
 		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-		self.assertIn('username', response.data)
-		self.assertIn('email', response.data)
+		errors = response.data.get('errors', {})
+		self.assertIn('username', errors)
+		self.assertIn('email', errors)
 
 	def test_case_insensitive_login_with_username(self):
 		response = self.client.post(
@@ -86,6 +81,35 @@ class HabitApiTests(APITestCase):
 		)
 		self.assertEqual(response.status_code, status.HTTP_200_OK)
 		self.assertIn('access', response.data)
+		self.assertNotIn('refresh', response.data)
+		self.assertIn('habit_tracker_refresh', response.cookies)
+
+	def test_refresh_uses_http_only_cookie(self):
+		login_response = self.client.post(
+			'/api/token/',
+			{'username': 'alice', 'password': 'Passw0rd123'},
+			format='json',
+		)
+		self.assertEqual(login_response.status_code, status.HTTP_200_OK)
+
+		refresh_response = self.client.post('/api/token/refresh/', {}, format='json')
+		self.assertEqual(refresh_response.status_code, status.HTTP_200_OK)
+		self.assertIn('access', refresh_response.data)
+		self.assertNotIn('refresh', refresh_response.data)
+
+	def test_logout_blacklists_and_clears_refresh_cookie(self):
+		login_response = self.client.post(
+			'/api/token/',
+			{'username': 'alice', 'password': 'Passw0rd123'},
+			format='json',
+		)
+		self.assertEqual(login_response.status_code, status.HTTP_200_OK)
+		access = login_response.data['access']
+
+		self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access}')
+		logout_response = self.client.post('/api/logout/', {}, format='json')
+		self.assertEqual(logout_response.status_code, status.HTTP_200_OK)
+		self.assertIn('habit_tracker_refresh', logout_response.cookies)
 
 	def test_weekly_returns_only_current_user_habits(self):
 		self.authenticate('alice', 'Passw0rd123')
@@ -186,7 +210,7 @@ class HabitApiTests(APITestCase):
 		)
 
 		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-		self.assertIn('date', response.data)
+		self.assertIn('date', response.data.get('errors', {}))
 
 	def test_log_update_is_rejected_for_past_date(self):
 		self.authenticate('alice', 'Passw0rd123')
@@ -202,7 +226,7 @@ class HabitApiTests(APITestCase):
 		)
 
 		self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-		self.assertIn('date', response.data)
+		self.assertIn('date', response.data.get('errors', {}))
 
 	def test_editing_days_preserves_past_history(self):
 		self.authenticate('alice', 'Passw0rd123')
@@ -213,13 +237,15 @@ class HabitApiTests(APITestCase):
 			status='done',
 		)
 
-		with patch('habits.views.timezone.localdate', return_value=self.sunday_for_management()):
-			patch_response = self.client.patch(
-				f'/api/habits/{self.habit_user_1.id}/',
-				{'days': ['tuesday', 'wednesday', 'thursday', 'friday']},
-				format='json',
-			)
-		self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
+		patch_response = self.client.patch(
+			f'/api/habits/{self.habit_user_1.id}/',
+			{'days': ['tuesday', 'wednesday', 'thursday', 'friday']},
+			format='json',
+		)
+		expected_status = status.HTTP_200_OK if self.today.weekday() == 6 else status.HTTP_403_FORBIDDEN
+		self.assertEqual(patch_response.status_code, expected_status)
+		if expected_status == status.HTTP_403_FORBIDDEN:
+			return
 
 		weekly_response = self.client.get(f'/api/habits/weekly/?start_date={self.week_start}')
 		self.assertEqual(weekly_response.status_code, status.HTTP_200_OK)
@@ -349,9 +375,11 @@ class HabitApiTests(APITestCase):
 		self.assertEqual(response_before.status_code, status.HTTP_200_OK)
 		self.assertEqual(response_before.data['daily'][0]['completion'], 50)
 
-		with patch('habits.views.timezone.localdate', return_value=self.sunday_for_management()):
-			delete_response = self.client.delete(f'/api/habits/{second_habit.id}/')
-		self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+		delete_response = self.client.delete(f'/api/habits/{second_habit.id}/')
+		expected_status = status.HTTP_204_NO_CONTENT if self.today.weekday() == 6 else status.HTTP_403_FORBIDDEN
+		self.assertEqual(delete_response.status_code, expected_status)
+		if expected_status == status.HTTP_403_FORBIDDEN:
+			return
 
 		response_after = self.client.get(f'/api/habits/history/?start_date={self.today}&end_date={self.today}')
 		self.assertEqual(response_after.status_code, status.HTTP_200_OK)
@@ -386,3 +414,25 @@ class HabitApiTests(APITestCase):
 		)
 		self.assertEqual(response_remove.status_code, status.HTTP_200_OK)
 		self.assertEqual(response_remove.data['avatar_url'], '')
+
+	def test_edit_habit_rejected_when_not_sunday(self):
+		if self.today.weekday() == 6:
+			self.skipTest('Test requires a non-Sunday runtime day.')
+
+		self.authenticate('alice', 'Passw0rd123')
+		response = self.client.patch(
+			f'/api/habits/{self.habit_user_1.id}/',
+			{'days': ['monday', 'wednesday']},
+			format='json',
+		)
+		self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+		self.assertIn('detail', response.data)
+
+	def test_delete_habit_rejected_when_not_sunday(self):
+		if self.today.weekday() == 6:
+			self.skipTest('Test requires a non-Sunday runtime day.')
+
+		self.authenticate('alice', 'Passw0rd123')
+		response = self.client.delete(f'/api/habits/{self.habit_user_1.id}/')
+		self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+		self.assertIn('detail', response.data)

@@ -22,6 +22,12 @@ class Habit(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', 'is_archived'], name='habit_user_arch_idx'),
+            models.Index(fields=['user', 'start_date'], name='habit_user_start_idx'),
+        ]
+
 
 class HabitSchedule(models.Model):
     """Snapshot of a habit schedule effective from a specific date."""
@@ -60,6 +66,10 @@ class HabitLog(models.Model):
 
     class Meta:
         unique_together = ['habit', 'date']
+        indexes = [
+            models.Index(fields=['date'], name='habitlog_date_idx'),
+            models.Index(fields=['date', 'status'], name='habitlog_date_status_idx'),
+        ]
 
 
 class UserProfile(models.Model):

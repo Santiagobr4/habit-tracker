@@ -88,11 +88,29 @@ Required for production:
 - `CSRF_TRUSTED_ORIGINS`: comma-separated trusted origins
 - `DRF_THROTTLE_ANON`: API rate for anonymous traffic (default `60/min`)
 - `DRF_THROTTLE_USER`: API rate for authenticated traffic (default `180/min`)
+- `DRF_THROTTLE_AUTH_LOGIN`: login rate limit (default `10/min`)
+- `DRF_THROTTLE_AUTH_REGISTER`: register rate limit (default `5/min`)
+- `DATABASE_URL`: PostgreSQL DSN (required in production)
+- `REDIS_URL`: Redis DSN for cache/leaderboard caching
 
 Optional JWT settings:
 
 - `JWT_ROTATE_REFRESH_TOKENS`
 - `JWT_BLACKLIST_AFTER_ROTATION`
+- `JWT_ACCESS_MINUTES`
+- `AUTH_REFRESH_COOKIE`
+- `AUTH_REFRESH_COOKIE_PATH`
+- `AUTH_REFRESH_COOKIE_MAX_AGE`
+- `AUTH_REFRESH_COOKIE_SAMESITE`
+- `AUTH_REFRESH_COOKIE_SECURE`
+- `LEADERBOARD_MAX_USERS`
+- `SECURE_REFERRER_POLICY`
+- `CSP_DEFAULT_SRC`
+- `CSP_SCRIPT_SRC`
+- `CSP_STYLE_SRC`
+- `CSP_IMG_SRC`
+- `CSP_CONNECT_SRC`
+- `CSP_FONT_SRC`
 
 ### Frontend (`habit-tracker-frontend/.env`)
 
@@ -115,47 +133,23 @@ pnpm build
 pnpm preview
 ```
 
-## Production Build
+## Docker Deployment
 
-### Frontend
+The repository includes production-ready container files:
 
-```bash
-pnpm build
-```
+- `habit-tracker/Dockerfile` (Django + Gunicorn)
+- `habit-tracker-frontend/Dockerfile` (Vite build + Nginx static/reverse proxy)
+- `docker-compose.yml` in workspace root (backend, frontend, postgres, redis)
 
-Build output is generated in `habit-tracker-frontend/dist`.
-
-### Backend
-
-Use production settings via `.env` and run with Gunicorn/Uvicorn behind Nginx.
-
-## Deployment Guide (Reference)
-
-### Option A: VPS + Nginx + Gunicorn
-
-1. Provision Ubuntu server
-2. Install Python, Node, Nginx
-3. Deploy backend and frontend source
-4. Build frontend (`pnpm build`) and serve static files via Nginx
-5. Run backend with Gunicorn:
+Run from the workspace root (`c:/Users/santi/Documents/Dev`):
 
 ```bash
-gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 60
+docker compose up --build
 ```
 
-6. Configure Nginx reverse proxy:
-   - `/api/` -> Gunicorn
-   - `/media/` -> media folder
-   - `/` -> frontend `dist`
+Frontend URL: `http://localhost`
 
-### Option B: Docker
-
-Recommended container strategy:
-
-- `backend` service: Django + Gunicorn
-- `frontend` service: built static assets
-- `nginx` service: reverse proxy and static serving
-- `postgres` service for production-grade DB
+In this setup, Nginx serves the SPA and proxies `/api/*` to Django.
 
 ## API Endpoints (Main)
 
@@ -166,6 +160,7 @@ Base path: `/api`
 - `POST /register/`
 - `POST /token/`
 - `POST /token/refresh/`
+- `POST /logout/`
 
 ### Profile
 
@@ -201,7 +196,10 @@ Base path: `/api`
 - Keep `SECRET_KEY` private and strong.
 - Keep `DEBUG=false` in production.
 - Restrict CORS and CSRF trusted origins.
-- Consider HttpOnly refresh token strategy for frontend auth hardening.
+- Refresh token is stored in HttpOnly cookie.
+- Access token is returned in response body and held in frontend memory.
+- Token blacklist is enabled for refresh token revocation.
+- CSP and security headers are applied through middleware.
 
 ## Testing Strategy
 
